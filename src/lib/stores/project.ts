@@ -1283,15 +1283,30 @@ export const layerVisibility = writable<{ walls: boolean; doors: boolean; window
 
 // --- Lock ---
 /** Lock the supported selection together; unlock when every item is already locked. */
+/** Lock the supported selection together; unlock when every item is already locked. */
 export function toggleSelectionLock(ids: ReadonlySet<string>) {
   const floor = get(activeFloor);
   if (!floor) return;
-  const items = [...floor.furniture, ...floor.entourage ?? []].filter(item => ids.has(item.id));
+
+  const items = [
+    ...floor.walls,
+    ...floor.furniture,
+    ...(floor.entourage ?? [])
+  ].filter(item => ids.has(item.id));
+
   if (!items.length) return;
+
   const locked = items.some(item => !item.locked);
+
   mutate(f => {
-    for (const item of [...f.furniture, ...f.entourage ?? []]) {
-      if (ids.has(item.id)) item.locked = locked;
+    for (const item of [
+      ...f.walls,
+      ...f.furniture,
+      ...(f.entourage ?? [])
+    ]) {
+      if (ids.has(item.id)) {
+        item.locked = locked;
+      }
     }
   }, locked ? 'Locked selection' : 'Unlocked selection');
 }

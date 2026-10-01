@@ -9,7 +9,7 @@
   import { planContentBounds, hasPlanContent } from '$lib/utils/planContentBounds';
   import { connectedWallEndpoints } from '$lib/utils/wallEditing';
   import { createDrawScheduler } from '$lib/utils/drawScheduler';
-  import { activeFloor, selectedTool, selectedElementId, selectedElementIds, selectedRoomId, addWall, addDoor, addWindow, updateWall, moveWallEndpoint, moveWallGeometryDuringDrag, updateDoor, updateWindow, addFurniture, moveFurniture, transformFurnitureDuringDrag, rotateFurniture, rotateSelection, setFurnitureRotation, scaleFurniture, removeElement, placingFurnitureId, placingRotation, placingDoorType, placingWindowType, detectedRoomsStore, duplicateDoor, duplicateWindow, duplicateFurniture, duplicateSelection, pasteSelection, moveWallParallel, splitWall, wallSplitIntersectsOpening, snapEnabled, placingStair, addStair, moveStair, updateStair, placingColumn, placingColumnShape, addColumn, moveColumn, updateColumn, calibrationMode, calibrationPoints, updateBackgroundImage, setBackgroundImage, canvasZoom, canvasMinimumZoom, canvasCamX, canvasCamY, panMode, showFurnitureStore, addGuide, moveGuide, removeGuide, beginUndoGroup, endUndoGroup, layerVisibility, updateRoom, addMeasurement, updateMeasurement, removeMeasurement, addAnnotation, removeAnnotation, updateAnnotation, addTextAnnotation, removeTextAnnotation, updateTextAnnotation, moveTextAnnotation, toggleFurnitureLock, toggleSelectionLock, createGroup, ungroupElements, findGroupForElement, placingEntourageId, addEntourageItem, moveEntourage, resizeEntourage, currentProject, elevationWallId, elevationPickMode } from '$lib/stores/project';
+  import { activeFloor, selectedTool, selectedElementId, selectedElementIds, selectedRoomId, addWall, addDoor, addWindow, updateWall, moveWallEndpoint, moveWallGeometryDuringDrag, updateDoor, updateWindow, addFurniture, moveFurniture, beginDrag, transformFurnitureDuringDrag, rotateFurniture, rotateSelection, setFurnitureRotation, scaleFurniture, removeElement, placingFurnitureId, placingRotation, placingDoorType, placingWindowType, detectedRoomsStore, duplicateDoor, duplicateWindow, duplicateFurniture, duplicateSelection, pasteSelection, moveWallParallel, splitWall, wallSplitIntersectsOpening, snapEnabled, placingStair, addStair, moveStair, updateStair, placingColumn, placingColumnShape, addColumn, moveColumn, updateColumn, calibrationMode, calibrationPoints, updateBackgroundImage, setBackgroundImage, canvasZoom, canvasMinimumZoom, canvasCamX, canvasCamY, panMode, showFurnitureStore, addGuide, moveGuide, removeGuide, beginUndoGroup, endUndoGroup, layerVisibility, updateRoom, addMeasurement, updateMeasurement, removeMeasurement, addAnnotation, removeAnnotation, updateAnnotation, addTextAnnotation, removeTextAnnotation, updateTextAnnotation, moveTextAnnotation, toggleFurnitureLock, toggleSelectionLock, createGroup, ungroupElements, findGroupForElement, placingEntourageId, addEntourageItem, moveEntourage, resizeEntourage, currentProject, elevationWallId, elevationPickMode } from '$lib/stores/project';
   import type { Point, Wall, Door, Window as Win, FurnitureItem, Stair, Column, GuideLine, Measurement, Annotation, TextAnnotation, CustomEntourageDef } from '$lib/models/types';
   import type { Floor, Room } from '$lib/models/types';
   import { resolveRoomGeometry, roomLabelPosition, roomCentroid } from '$lib/utils/roomDetection';
@@ -2871,7 +2871,12 @@
         }
       }
     }
-    if (draggingRoomId && currentFloor && roomDragStartPositions.size > 0) {
+    if (
+      draggingRoomId &&
+      !allWallsLocked &&
+      currentFloor &&
+      roomDragStartPositions.size > 0
+    ) {
       const rSnapStep = currentSnapToGrid ? currentGridSize : SNAP;
       const dx = Math.round((mousePos.x - roomDragStartMouse.x) / rSnapStep) * rSnapStep;
       const dy = Math.round((mousePos.y - roomDragStartMouse.y) / rSnapStep) * rSnapStep;
@@ -3353,13 +3358,43 @@
     return { x: wallStart.x + (dx / d) * lenCm, y: wallStart.y + (dy / d) * lenCm };
   }
 
+  let allWallsLocked = $derived(
+    !!$activeFloor &&
+    $activeFloor.walls.length > 0 &&
+    $activeFloor.walls.every((wall) => wall.locked === true)
+  );
+
+  function toggleAllWallsLock() {
+    const floor = $activeFloor;
+    if (!floor || floor.walls.length === 0) return;
+
+    const shouldLock = !floor.walls.every(
+      (wall) => wall.locked === true
+    );
+
+    const idsToToggle = new Set(
+      floor.walls
+        .filter((wall) => Boolean(wall.locked) !== shouldLock)
+        .map((wall) => wall.id)
+    );
+
+    if (idsToToggle.size > 0) {
+      toggleSelectionLock(idsToToggle);
+    }
+  }
+
   function onKeyDown(e: KeyboardEvent) {
     if (hasOpenModal()) return;
-    if (e.target === canvas && (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))) {
+
+    if (
+      e.target === canvas &&
+      (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))
+    ) {
       e.preventDefault();
       openKeyboardContextMenu();
       return;
     }
+
     // This listener is on window, so field keystrokes reach it too. Keep every
     // canvas action (including Space, select/copy/paste and annotation deletion)
     // out of focused inputs; only the explicit Save shortcut is global there.
@@ -3367,31 +3402,272 @@
       handleGlobalShortcut(e);
       return;
     }
+
     if (isControlKey(e)) return;
+
     shiftDown = e.shiftKey;
-    if (e.code === 'Space') { spaceDown = true; e.preventDefault(); return; }
+
+    if (e.code === 'Space') {
+      spaceDown = true;
+      e.preventDefault();
+      return;
+    }
+
+    // ---------------------------------------------------------------------------
+    // NUDGE SELECTED OBJECT / GROUP
+    //
+    // Arrow          = 1 cm
+    // Shift + Arrow  = 10 cm
+    // Option + Arrow = 0.1 cm
+    //
+    // fitSelectionIds() is important here because it expands grouped selections.
+    // ---------------------------------------------------------------------------
+    if (
+      currentFloor &&
+      ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) &&
+      !e.metaKey &&
+      !e.ctrlKey
+    ) {
+      const idsToMove = fitSelectionIds();
+
+      const step = e.altKey ? 0.1 : e.shiftKey ? 10 : 1;
+
+      let dx = 0;
+      let dy = 0;
+
+      switch (e.key) {
+        case 'ArrowLeft':
+          dx = -step;
+          break;
+        case 'ArrowRight':
+          dx = step;
+          break;
+        case 'ArrowUp':
+          dy = -step;
+          break;
+        case 'ArrowDown':
+          dy = step;
+          break;
+      }
+
+      // Only include objects we actually know how to nudge.
+      // Locked furniture/walls are deliberately excluded.
+      const movableIds = [...idsToMove].filter((id) => {
+        const furniture = currentFloor.furniture.find(
+          (item) => item.id === id
+        );
+
+        if (furniture) {
+          return !furniture.locked;
+        }
+
+        const wall = currentFloor.walls.find(
+          (item) => item.id === id
+        );
+
+        if (wall) {
+          return !wall.locked;
+        }
+
+        if (currentFloor.stairs?.some((item) => item.id === id)) {
+          return true;
+        }
+
+        if (currentFloor.columns?.some((item) => item.id === id)) {
+          return true;
+        }
+
+        const entourage = currentFloor.entourage?.find(
+          (item) => item.id === id
+        );
+
+        if (entourage) {
+          return !entourage.locked;
+        }
+
+        if (currentFloor.textAnnotations?.some((item) => item.id === id)) {
+          return true;
+        }
+
+        return false;
+      });
+
+      if (movableIds.length > 0) {
+        e.preventDefault();
+
+        // One undo snapshot for the entire nudge operation.
+        beginDrag(
+          movableIds.length > 1
+            ? 'Nudged selection'
+            : 'Nudged element'
+        );
+
+        for (const id of movableIds) {
+          // Furniture
+          const furniture = currentFloor.furniture.find(
+            (item) => item.id === id
+          );
+
+          if (furniture) {
+            moveFurniture(id, {
+              x: furniture.position.x + dx,
+              y: furniture.position.y + dy
+            });
+
+            continue;
+          }
+
+          // Walls
+          const wall = currentFloor.walls.find(
+            (item) => item.id === id
+          );
+
+          if (wall) {
+            moveWallParallel(id, dx, dy);
+            continue;
+          }
+
+          // Stairs
+          const stair = currentFloor.stairs?.find(
+            (item) => item.id === id
+          );
+
+          if (stair) {
+            moveStair(id, {
+              x: stair.position.x + dx,
+              y: stair.position.y + dy
+            });
+
+            continue;
+          }
+
+          // Columns
+          const column = currentFloor.columns?.find(
+            (item) => item.id === id
+          );
+
+          if (column) {
+            moveColumn(id, {
+              x: column.position.x + dx,
+              y: column.position.y + dy
+            });
+
+            continue;
+          }
+
+          // Entourage
+          const entourage = currentFloor.entourage?.find(
+            (item) => item.id === id
+          );
+
+          if (entourage) {
+            moveEntourage(id, {
+              x: entourage.position.x + dx,
+              y: entourage.position.y + dy
+            });
+
+            continue;
+          }
+
+          // Text annotations
+          const textAnnotation = currentFloor.textAnnotations?.find(
+            (item) => item.id === id
+          );
+
+          if (textAnnotation) {
+            moveTextAnnotation(id, {
+              x: textAnnotation.position.x + dx,
+              y: textAnnotation.position.y + dy
+            });
+
+            continue;
+          }
+        }
+
+        return;
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // ROTATE SELECTED OBJECT / GROUP
+    //
+    // [              = -15°
+    // ]              = +15°
+    // Shift + [ / ]  = -/+90°
+    // Option + [ / ] = -/+1°
+    //
+    // rotateSelection() rotates the objects around the collective group centre.
+    // ---------------------------------------------------------------------------
+    if (
+      currentFloor &&
+      (e.code === 'BracketLeft' || e.code === 'BracketRight') &&
+      !e.metaKey &&
+      !e.ctrlKey
+    ) {
+      const idsToRotate = fitSelectionIds();
+
+      if (idsToRotate.size > 0) {
+        e.preventDefault();
+
+        const direction =
+          e.code === 'BracketLeft'
+            ? -1
+            : 1;
+
+        const rotationStep =
+          e.altKey
+            ? 1
+            : e.shiftKey
+              ? 90
+              : 15;
+
+        rotateSelection(
+          idsToRotate,
+          direction * rotationStep
+        );
+
+        return;
+      }
+    }
 
     // Exact-length entry while drawing a wall (issue #6):
     // type a number, then Enter places the wall at exactly that length.
-    if (currentTool === 'wall' && wallStart && !editingTextAnnotationId && !e.metaKey && !e.ctrlKey) {
+    if (
+      currentTool === 'wall' &&
+      wallStart &&
+      !editingTextAnnotationId &&
+      !e.metaKey &&
+      !e.ctrlKey
+    ) {
       if (/^[0-9.]$/.test(e.key)) {
         typedWallLength += e.key;
         markDirty();
         e.preventDefault();
         return;
       }
+
       if (e.key === 'Backspace' && typedWallLength) {
         typedWallLength = typedWallLength.slice(0, -1);
         markDirty();
         e.preventDefault();
         return;
       }
+
       if (e.key === 'Enter' && typedWallLengthCm() !== null) {
-        const endPt = applyTypedWallLength(snapWallEndPoint(mousePos));
-        if (Math.hypot(endPt.x - wallStart.x, endPt.y - wallStart.y) > 1) {
+        const endPt = applyTypedWallLength(
+          snapWallEndPoint(mousePos)
+        );
+
+        if (
+          Math.hypot(
+            endPt.x - wallStart.x,
+            endPt.y - wallStart.y
+          ) > 1
+        ) {
           addWall(wallStart, endPt);
           wallStart = endPt;
         }
+
         typedWallLength = '';
         markDirty();
         e.preventDefault();
@@ -3399,10 +3675,19 @@
       }
     }
 
-    if ((e.key === 'Delete' || e.key === 'Backspace') && currentSelectedIds.size >= 2) clearAuxiliarySelection();
+    if (
+      (e.key === 'Delete' || e.key === 'Backspace') &&
+      currentSelectedIds.size >= 2
+    ) {
+      clearAuxiliarySelection();
+    }
 
     // Delete selected guide line
-    if ((e.key === 'Delete' || e.key === 'Backspace') && currentSelectedIds.size < 2 && selectedGuideId) {
+    if (
+      (e.key === 'Delete' || e.key === 'Backspace') &&
+      currentSelectedIds.size < 2 &&
+      selectedGuideId
+    ) {
       removeGuide(selectedGuideId);
       selectedGuideId = null;
       selectedElementId.set(null);
@@ -3411,7 +3696,11 @@
     }
 
     // Delete selected measurement
-    if ((e.key === 'Delete' || e.key === 'Backspace') && currentSelectedIds.size < 2 && selectedMeasurementId) {
+    if (
+      (e.key === 'Delete' || e.key === 'Backspace') &&
+      currentSelectedIds.size < 2 &&
+      selectedMeasurementId
+    ) {
       removeMeasurement(selectedMeasurementId);
       selectedMeasurementId = null;
       selectedElementId.set(null);
@@ -3420,7 +3709,12 @@
     }
 
     // Delete selected text annotation
-    if ((e.key === 'Delete' || e.key === 'Backspace') && currentSelectedIds.size < 2 && selectedTextAnnotationId && !editingTextAnnotationId) {
+    if (
+      (e.key === 'Delete' || e.key === 'Backspace') &&
+      currentSelectedIds.size < 2 &&
+      selectedTextAnnotationId &&
+      !editingTextAnnotationId
+    ) {
       removeTextAnnotation(selectedTextAnnotationId);
       selectedTextAnnotationId = null;
       selectedElementId.set(null);
@@ -3429,7 +3723,11 @@
     }
 
     // Delete selected annotation
-    if ((e.key === 'Delete' || e.key === 'Backspace') && currentSelectedIds.size < 2 && selectedAnnotationId) {
+    if (
+      (e.key === 'Delete' || e.key === 'Backspace') &&
+      currentSelectedIds.size < 2 &&
+      selectedAnnotationId
+    ) {
       removeAnnotation(selectedAnnotationId);
       selectedAnnotationId = null;
       selectedElementId.set(null);
@@ -3440,80 +3738,160 @@
     // Canvas-specific Escape handling (before global shortcut eats it)
     if (e.code === 'Escape') {
       splitBlocked = false;
+
       calibrationMode.set(false);
       calibrationPoints.set([]);
+
       finishCanvasGesture();
       clearAuxiliarySelection();
+
       selectedRoomId.set(null);
       elevationPickMode.set(false);
-      wallStart = null; wallSequenceFirst = null; typedWallLength = '';
+
+      wallStart = null;
+      wallSequenceFirst = null;
+      typedWallLength = '';
+
       placingFurnitureId.set(null);
       placingEntourageId.set(null);
       placingRotation.set(0);
+
       editingTextAnnotationId = null;
       textAnnotationMode = false;
+
       measureStart = null;
       measureEnd = null;
+
       annotationStart = null;
+
       marqueeStart = null;
       marqueeEnd = null;
     }
 
     // Select All (Ctrl+A / Cmd+A)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'a' && !e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'a' &&
+      !e.shiftKey
+    ) {
       e.preventDefault();
       selectAllPlanElements();
       return;
     }
 
     // Deselect All (Ctrl+D / Cmd+D)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'd' && !e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'd' &&
+      !e.shiftKey
+    ) {
       e.preventDefault();
+
       clearAuxiliarySelection();
       selectedRoomId.set(null);
+
       selectedElementIds.set(new Set());
       selectedElementId.set(null);
+
       return;
     }
 
     // Toggle Lock (Ctrl+L / Cmd+L)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'l' && !e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'l' &&
+      !e.shiftKey
+    ) {
       e.preventDefault();
+
       if (currentFloor) {
-        const idsToLock = currentSelectedIds.size > 0 ? currentSelectedIds : (currentSelectedId ? new Set([currentSelectedId]) : new Set<string>());
+        const idsToLock =
+          currentSelectedIds.size > 0
+            ? currentSelectedIds
+            : currentSelectedId
+              ? new Set([currentSelectedId])
+              : new Set<string>();
+
         toggleSelectionLock(idsToLock);
       }
+
       return;
     }
 
     // Group (Ctrl+G / Cmd+G)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'g' && !e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'g' &&
+      !e.shiftKey
+    ) {
       e.preventDefault();
-      if (currentFloor && currentSelectedIds.size >= 2) {
+
+      if (
+        currentFloor &&
+        currentSelectedIds.size >= 2
+      ) {
         createGroup([...currentSelectedIds]);
       }
+
       return;
     }
 
     // Ungroup (Ctrl+Shift+G / Cmd+Shift+G)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'G' && e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'G' &&
+      e.shiftKey
+    ) {
       e.preventDefault();
+
       if (currentFloor) {
-        const idsToUngroup = currentSelectedIds.size > 0 ? [...currentSelectedIds] : (currentSelectedId ? [currentSelectedId] : []);
-        if (idsToUngroup.length > 0) ungroupElements(idsToUngroup);
+        const idsToUngroup =
+          currentSelectedIds.size > 0
+            ? [...currentSelectedIds]
+            : currentSelectedId
+              ? [currentSelectedId]
+              : [];
+
+        if (idsToUngroup.length > 0) {
+          ungroupElements(idsToUngroup);
+        }
       }
+
       return;
     }
 
     // Copy (Ctrl+C / Cmd+C)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.shiftKey) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'c' &&
+      !e.shiftKey
+    ) {
       if (currentFloor) {
-        const copyable = [...currentFloor.walls,...currentFloor.doors,...currentFloor.windows,...currentFloor.furniture,
-          ...currentFloor.stairs ?? [],...currentFloor.columns ?? [],...currentFloor.entourage ?? [],
-          ...currentFloor.textAnnotations ?? [],...currentFloor.measurements ?? [],...currentFloor.annotations ?? []];
-        const ids = [...fitSelectionIds()].filter(id => copyable.some(item => item.id === id));
+        const copyable = [
+          ...currentFloor.walls,
+          ...currentFloor.doors,
+          ...currentFloor.windows,
+          ...currentFloor.furniture,
+          ...(currentFloor.stairs ?? []),
+          ...(currentFloor.columns ?? []),
+          ...(currentFloor.entourage ?? []),
+          ...(currentFloor.textAnnotations ?? []),
+          ...(currentFloor.measurements ?? []),
+          ...(currentFloor.annotations ?? [])
+        ];
+
+        const ids = [...fitSelectionIds()].filter(
+          (id) => copyable.some((item) => item.id === id)
+        );
+
         if (ids.length) {
-          clipboard = { floor: structuredClone(get(activeFloor)!), ids, step: 1, projectId: get(currentProject)!.id };
+          clipboard = {
+            floor: structuredClone(get(activeFloor)!),
+            ids,
+            step: 1,
+            projectId: get(currentProject)!.id
+          };
+
           e.preventDefault();
           return;
         }
@@ -3521,15 +3899,34 @@
     }
 
     // Paste (Ctrl+V / Cmd+V)
-    if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !e.shiftKey) {
-      if (clipboard && clipboard.ids.length && currentFloor) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === 'v' &&
+      !e.shiftKey
+    ) {
+      if (
+        clipboard &&
+        clipboard.ids.length &&
+        currentFloor
+      ) {
         e.preventDefault();
-        const newIds = pasteSelection(clipboard.floor, new Set(clipboard.ids), clipboard.step);
+
+        const newIds = pasteSelection(
+          clipboard.floor,
+          new Set(clipboard.ids),
+          clipboard.step
+        );
+
         if (newIds.length) {
-          clipboard = { ...clipboard, step: clipboard.step + 1 };
+          clipboard = {
+            ...clipboard,
+            step: clipboard.step + 1
+          };
+
           selectedElementIds.set(new Set(newIds));
           selectedElementId.set(newIds[0]);
         }
+
         return;
       }
     }
@@ -3537,7 +3934,10 @@
     // Commit and release the active pointer gesture before replaying history.
     // Otherwise a later mouseup can write its pending label offset over Undo,
     // or close a geometry group against a history state restored mid-drag.
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'y')) {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      (e.key === 'z' || e.key === 'y')
+    ) {
       finishCanvasGesture();
     }
 
@@ -3545,28 +3945,58 @@
     const handled = handleGlobalShortcut(e, {
       rotateFurniture: () => {
         if (currentPlacingId) {
-          placingRotation.update(r => (r + 15) % 360);
+          placingRotation.update(
+            (r) => (r + 15) % 360
+          );
         } else if (currentFloor) {
+          // fitSelectionIds() makes the existing rotate shortcut group-aware too.
           rotateSelection(fitSelectionIds());
         }
       }
     });
+
     if (handled) return;
 
     if (e.key === 's' || e.key === 'S') {
-      projectSettings.update(s => ({ ...s, snapToGrid: !s.snapToGrid }));
+      projectSettings.update((s) => ({
+        ...s,
+        snapToGrid: !s.snapToGrid
+      }));
     }
+
     if (e.key === 'g' || e.key === 'G') {
       showGrid = !showGrid;
     }
-    if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+
+    if (
+      (e.key === 'f' || e.key === 'F') &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey
+    ) {
       e.preventDefault();
       zoomToFit(e.shiftKey);
     }
+
     // 'C' to close wall loop back to first point (but not Ctrl+C)
-    if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey && wallStart && wallSequenceFirst) {
-      if (Math.hypot(wallStart.x - wallSequenceFirst.x, wallStart.y - wallSequenceFirst.y) > 5) {
-        addWall(wallStart, wallSequenceFirst);
+    if (
+      (e.key === 'c' || e.key === 'C') &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      wallStart &&
+      wallSequenceFirst
+    ) {
+      if (
+        Math.hypot(
+          wallStart.x - wallSequenceFirst.x,
+          wallStart.y - wallSequenceFirst.y
+        ) > 5
+      ) {
+        addWall(
+          wallStart,
+          wallSequenceFirst
+        );
+
         wallStart = null;
         wallSequenceFirst = null;
       }
@@ -3949,6 +4379,25 @@
     ondragleave={onDragLeave}
     ondrop={onDrop}
   ></canvas>
+  <button
+    type="button"
+    style="position: absolute; top: 12px; right: 12px; z-index: 9999; pointer-events: auto;"
+    class={
+      allWallsLocked
+        ? 'rounded-md border border-red-500 bg-red-100 px-3 py-2 text-sm font-medium text-red-800 shadow-sm'
+        : 'rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50'
+    }
+    aria-pressed={allWallsLocked}
+    onpointerdown={(e) => {
+      e.stopPropagation();
+    }}
+    onclick={(e) => {
+      e.stopPropagation();
+      toggleAllWallsLock();
+    }}
+  >
+    {allWallsLocked ? '🔒 Walls locked' : '🔓 Lock walls'}
+  </button>
   <!-- Elevation pick mode hint chip -->
   {#if pickingElevation}
     <div class="absolute top-3 left-1/2 -translate-x-1/2 z-30 bg-slate-800/90 text-white text-xs font-medium px-3.5 py-1.5 rounded-full shadow-lg pointer-events-none flex items-center gap-1.5">

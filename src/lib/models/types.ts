@@ -40,6 +40,7 @@ export interface Wall {
   /** Exterior-specific overrides */
   exteriorColor?: string;
   exteriorTexture?: string;
+  locked?: boolean;
 }
 
 export function validWallHeight(value: unknown): value is number {
